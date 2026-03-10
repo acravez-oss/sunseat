@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SunSeat — Find Your Sunny Side</title>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
   :root {
     --ink: #1a1208;
@@ -336,6 +338,54 @@
     font-size: 12px;
     color: var(--rust);
     line-height: 1.6;
+  }
+
+  /* Map */
+  .map-wrap {
+    margin-bottom: 28px;
+  }
+
+  .map-label {
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    opacity: 0.5;
+    margin-bottom: 10px;
+    font-weight: 500;
+  }
+
+  #flightMap {
+    width: 100%;
+    height: 320px;
+    border-radius: 6px;
+    border: 1.5px solid rgba(26,18,8,0.12);
+    overflow: hidden;
+  }
+
+  .distance-strip {
+    display: flex;
+    gap: 24px;
+    margin-top: 10px;
+    font-size: 12px;
+  }
+
+  .distance-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .distance-value {
+    font-size: 1.1rem;
+    font-family: 'Playfair Display', serif;
+    font-weight: 700;
+  }
+
+  .distance-unit {
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    opacity: 0.45;
   }
 </style>
 </head>
@@ -728,6 +778,25 @@ function calculate() {
       </div>
     </div>
 
+    <div class="map-wrap">
+      <div class="map-label">Flight path</div>
+      <div id="flightMap"></div>
+      <div class="distance-strip">
+        <div class="distance-item">
+          <div class="distance-value" id="distMiles">—</div>
+          <div class="distance-unit">Miles</div>
+        </div>
+        <div class="distance-item">
+          <div class="distance-value" id="distNM">—</div>
+          <div class="distance-unit">Nautical Miles</div>
+        </div>
+        <div class="distance-item">
+          <div class="distance-value" id="distKm">—</div>
+          <div class="distance-unit">Kilometres</div>
+        </div>
+      </div>
+    </div>
+
     <div class="timeline-label">Sun position along the flight path</div>
     <div class="timeline">${timelineHTML}</div>
     <div class="timeline-legend">
@@ -748,6 +817,92 @@ function calculate() {
       ☀ <strong>Note:</strong> This uses great-circle routing (the shortest path). Actual routes vary due to airways, wind, and air traffic control, which can shift the sun's side by a segment or two. Results are most accurate for east–west and transatlantic flights.
     </div>
   `;
+
+  // ─── Map rendering ────────────────────────────────────────────────────────
+  // We use Leaflet.js to draw an interactive map with the great-circle path.
+  // The path is approximated by 60 interpolated points — enough to look smooth.
+
+  // Great-circle distance in km (using haversine formula)
+  const toRad = d => d * Math.PI / 180;
+  const R = 6371; // Earth radius in km
+  const dLat = toRad(dest.lat - orig.lat);
+  const dLon = toRad(dest.lon - orig.lon);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(orig.lat)) * Math.cos(toRad(dest.lat)) * Math.sin(dLon/2)**2;
+  const distKm = 2 * R * Math.asin(Math.sqrt(a));
+  const distMiles = distKm * 0.621371;
+  const distNM = distKm * 0.539957;
+
+  document.getElementById('distMiles').textContent = Math.round(distMiles).toLocaleString();
+  document.getElementById('distNM').textContent = Math.round(distNM).toLocaleString();
+  document.getElementById('distKm').textContent = Math.round(distKm).toLocaleString();
+
+  // Build 60-point great-circle path for smooth curve on the map.
+  //
+  // Antimeridian fix: Leaflet draws lines by connecting longitude values
+  // numerically. A flight from LAX (-118) to NRT (+140) would normally draw
+  // the wrong way because +140 is numerically greater than -118, so Leaflet
+  // goes eastward across the Atlantic instead of westward across the Pacific.
+  //
+  // The fix is longitude "unwrapping": after each step, if the longitude jumped
+  // by more than 180 degrees from the previous point, we've crossed the
+  // antimeridian — so we add or subtract 360 to keep the values numerically
+  // continuous. NRT's +140 becomes -220 (140 - 360), which is correctly west
+  // of LAX's -118. Leaflet handles out-of-range longitudes fine.
+  const pathPoints = [];
+  for (let i = 0; i <= 60; i++) {
+    const pt = interpolate(orig.lat, orig.lon, dest.lat, dest.lon, i / 60);
+    let lon = pt.lon;
+    if (pathPoints.length > 0) {
+      const prevLon = pathPoints[pathPoints.length - 1][1];
+      while (lon - prevLon > 180)  lon -= 360;
+      while (lon - prevLon < -180) lon += 360;
+    }
+    pathPoints.push([pt.lat, lon]);
+  }
+
+  // Destroy any previous map instance (important when user recalculates)
+  if (window._flightMap) {
+    window._flightMap.remove();
+    window._flightMap = null;
+  }
+
+  // Create the Leaflet map
+  // CartoDB Positron is a clean, minimal tile style that fits the app's aesthetic
+  const map = L.map('flightMap', { zoomControl: true, scrollWheelZoom: false });
+  window._flightMap = map;
+
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution: '© OpenStreetMap contributors, © CARTO',
+    maxZoom: 19
+  }).addTo(map);
+
+  // Draw the flight path as a polyline
+  // Note: for flights crossing the antimeridian (e.g. LA→Tokyo) Leaflet needs
+  // help — we handle this by not wrapping coordinates, which works in most cases
+  const pathLine = L.polyline(pathPoints, {
+    color: '#e8a020',
+    weight: 2.5,
+    opacity: 0.85,
+    dashArray: '6 4'
+  }).addTo(map);
+
+  // Custom minimal marker icon
+  const dotIcon = (label) => L.divIcon({
+    className: '',
+    html: `<div style="
+      background:#1a1208;color:#faf6ee;
+      font-family:'DM Mono',monospace;font-size:10px;font-weight:500;
+      padding:3px 7px;border-radius:3px;white-space:nowrap;
+      box-shadow:0 2px 6px rgba(0,0,0,0.25);">${label}</div>`,
+    iconAnchor: [0, 0]
+  });
+
+  L.marker([orig.lat, orig.lon], { icon: dotIcon(originCode) }).addTo(map);
+  L.marker([dest.lat, dest.lon], { icon: dotIcon(destCode) }).addTo(map);
+
+  // Fit the map view to show the full path with some padding
+  map.fitBounds(pathLine.getBounds(), { padding: [32, 32] });
+
 }
 </script>
 </body>
